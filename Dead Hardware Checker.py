@@ -1,17 +1,3 @@
-"""
-Dead Hardware Checker
-----------------------
-A Windows-only utility that reports:
-  - Exact Windows version/build
-  - The product key associated with this installation (OEM key if present,
-    otherwise decoded from the registry's DigitalProductId - this only reads
-    the key already stored on YOUR machine, it does not "crack" anything)
-  - CPU / GPU / Memory / Disk information
-
-Run this on a Windows machine with: python dead_hardware_checker.py
-(Requires only the Python standard library - no pip installs needed.)
-"""
-
 import sys
 import platform
 import subprocess
@@ -38,7 +24,20 @@ def run_powershell(command: str) -> str:
             ["powershell", "-NoProfile", "-Command", command],
             capture_output=True, text=True, timeout=20
         )
-        return result.stdout.strip()
+        out = result.stdout.strip()
+        if not out and result.stderr.strip():
+            return f"(error: {result.stderr.strip()[:120]})"
+        return out
+    except Exception as e:
+        return f"(error: {e})"
+
+
+def read_registry_value(hive, path, name):
+    try:
+        key = winreg.OpenKey(hive, path)
+        value = winreg.QueryValueEx(key, name)[0]
+        winreg.CloseKey(key)
+        return value
     except Exception as e:
         return f"(error: {e})"
 
@@ -117,9 +116,11 @@ def get_windows_product_key() -> str:
         return f"Unable to retrieve product key ({e})"
 
 
-def get_key_edition(product_key: str) -> str:
-    """Ask PowerShell/WMI what edition the currently installed key/license
-    corresponds to (best-effort - Windows doesn't always expose this)."""
+def get_os_edition() -> str:
+    """Returns the OS edition/caption currently installed. Note: this is
+    the installed edition, not something derived from the product key
+    itself (Windows doesn't expose a reliable local mapping from key ->
+    edition without contacting activation servers)."""
     edition = run_powershell(
         "(Get-CimInstance -ClassName Win32_OperatingSystem).Caption"
     )
@@ -152,17 +153,124 @@ def get_memory() -> str:
 
 
 def get_disks() -> str:
+    """Returns total capacity plus a per-disk model/size breakdown."""
     output = run_powershell(
         "Get-CimInstance -ClassName Win32_DiskDrive | "
-        "Select-Object -ExpandProperty Size"
+        "ForEach-Object { \"$($_.Model)|$($_.Size)\" }"
     )
-    lines = [l for l in output.splitlines() if l.strip().isdigit()]
+    lines = [l for l in output.splitlines() if "|" in l]
     if not lines:
         return "Unknown"
-    total = sum(int(l) for l in lines)
-    per_disk = ", ".join(f"{int(l) / (1024**3):.0f} GB" for l in lines)
+    entries = []
+    total = 0
+    for l in lines:
+        model, _, size_str = l.partition("|")
+        try:
+            size = int(size_str.strip())
+            total += size
+            entries.append(f"{model.strip()} ({size / (1024**3):.0f} GB)")
+        except ValueError:
+            entries.append(model.strip())
     total_gb = total / (1024 ** 3)
-    return f"{total_gb:.0f} GB total across {len(lines)} disk(s) [{per_disk}]"
+    return f"{total_gb:.0f} GB total across {len(entries)} disk(s) [{', '.join(entries)}]"
+
+
+# ----------------------------------------------------------------------
+# Hardware / Windows identifiers
+# ----------------------------------------------------------------------
+
+def get_machine_guid() -> str:
+    return str(read_registry_value(
+        winreg.HKEY_LOCAL_MACHINE,
+        r"SOFTWARE\Microsoft\Cryptography",
+        "MachineGuid"
+    ))
+
+
+def get_windows_product_id() -> str:
+    """The 'Product ID' shown under Settings > About (AAAAA-BBBBB-CCCCC...),
+    distinct from the 25-character product key."""
+    return str(read_registry_value(
+        winreg.HKEY_LOCAL_MACHINE,
+        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+        "ProductId"
+    ))
+
+
+def get_install_date() -> str:
+    date_str = run_powershell(
+        "(Get-CimInstance -ClassName Win32_OperatingSystem).InstallDate"
+    )
+    return date_str if date_str else "Unknown"
+
+
+def get_system_uuid() -> str:
+    uuid = run_powershell(
+        "(Get-CimInstance -ClassName Win32_ComputerSystemProduct).UUID"
+    )
+    return uuid if uuid else "Unknown"
+
+
+def get_bios_serial() -> str:
+    serial = run_powershell(
+        "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"
+    )
+    return serial if serial else "Unknown"
+
+
+def get_motherboard_info() -> str:
+    info = run_powershell(
+        "$b = Get-CimInstance -ClassName Win32_BaseBoard; "
+        "\"$($b.Manufacturer) $($b.Product) (S/N: $($b.SerialNumber))\""
+    )
+    return info if info else "Unknown"
+
+
+def get_cpu_id() -> str:
+    pid = run_powershell(
+        "(Get-CimInstance -ClassName Win32_Processor).ProcessorId"
+    )
+    return pid if pid else "Unknown"
+
+
+def get_disk_serials() -> str:
+    output = run_powershell(
+        "Get-CimInstance -ClassName Win32_DiskDrive | "
+        "ForEach-Object { \"$($_.Model)|$($_.SerialNumber)\" }"
+    )
+    lines = [l for l in output.splitlines() if "|" in l]
+    if not lines:
+        return "Unknown"
+    entries = []
+    for l in lines:
+        model, _, serial = l.partition("|")
+        serial = serial.strip() or "N/A"
+        entries.append(f"{model.strip()}: {serial}")
+    return "; ".join(entries)
+
+
+def get_mac_addresses() -> str:
+    output = run_powershell(
+        "Get-CimInstance -ClassName Win32_NetworkAdapter | "
+        "Where-Object { $_.PhysicalAdapter -eq $true -and $_.MACAddress } | "
+        "ForEach-Object { \"$($_.Name): $($_.MACAddress)\" }"
+    )
+    return output.replace("\r\n", " | ") if output else "Unknown"
+
+
+def get_hardware_identifiers() -> list:
+    """Returns a list of (label, value) tuples for the identifiers section."""
+    return [
+        ("Windows Machine GUID", get_machine_guid()),
+        ("Windows Product ID", get_windows_product_id()),
+        ("System UUID", get_system_uuid()),
+        ("BIOS Serial Number", get_bios_serial()),
+        ("Motherboard", get_motherboard_info()),
+        ("CPU Processor ID", get_cpu_id()),
+        ("Disk Serial Numbers", get_disk_serials()),
+        ("Network MAC Addresses", get_mac_addresses()),
+        ("Windows Install Date", get_install_date()),
+    ]
 
 
 # ----------------------------------------------------------------------
@@ -173,7 +281,7 @@ class DeadHardwareChecker(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Dead Hardware Checker")
-        self.geometry("640x520")
+        self.geometry("700x600")
         self.configure(bg="#1e1e1e")
 
         title_label = tk.Label(
@@ -192,7 +300,7 @@ class DeadHardwareChecker(tk.Tk):
         checking_label.pack(pady=(0, 10))
 
         self.report_box = scrolledtext.ScrolledText(
-            self, width=76, height=22, font=("Consolas", 10),
+            self, width=84, height=26, font=("Consolas", 10),
             bg="#111111", fg="#eeeeee", insertbackground="white"
         )
         self.report_box.pack(padx=10, pady=5)
@@ -206,16 +314,21 @@ class DeadHardwareChecker(tk.Tk):
         )
         status_bar.pack(side="bottom", fill="x")
 
+        # Run the slow PowerShell/WMI work off the main thread so the UI
+        # doesn't freeze, but only ever touch Tkinter widgets via
+        # self.after(...), since Tkinter itself is not thread-safe.
         threading.Thread(target=self.run_checks, daemon=True).start()
 
     def set_status(self, text):
-        self.status_var.set(text)
+        self.after(0, lambda: self.status_var.set(text))
 
     def append_report(self, line):
-        self.report_box.configure(state="normal")
-        self.report_box.insert(tk.END, line + "\n")
-        self.report_box.configure(state="disabled")
-        self.report_box.see(tk.END)
+        def _do_append():
+            self.report_box.configure(state="normal")
+            self.report_box.insert(tk.END, line + "\n")
+            self.report_box.configure(state="disabled")
+            self.report_box.see(tk.END)
+        self.after(0, _do_append)
 
     def run_checks(self):
         self.set_status("Checking Windows version...")
@@ -226,9 +339,9 @@ class DeadHardwareChecker(tk.Tk):
         key = get_windows_product_key()
         self.append_report(f"Windows key: {key}")
 
-        self.set_status("Checking which edition the key licenses...")
-        edition = get_key_edition(key)
-        self.append_report(f"Key is licensed for: {edition}")
+        self.set_status("Checking OS edition...")
+        edition = get_os_edition()
+        self.append_report(f"OS edition: {edition}")
 
         self.set_status("Checking CPU...")
         self.append_report(f"CPU: {get_cpu()}")
@@ -241,6 +354,12 @@ class DeadHardwareChecker(tk.Tk):
 
         self.set_status("Checking disks...")
         self.append_report(f"Disk: {get_disks()}")
+
+        self.set_status("Collecting hardware identifiers...")
+        self.append_report("")
+        self.append_report("---- Hardware & Windows Identifiers ----")
+        for label, value in get_hardware_identifiers():
+            self.append_report(f"{label}: {value}")
 
         self.set_status("Done.")
 
